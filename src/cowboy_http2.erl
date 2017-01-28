@@ -56,10 +56,11 @@
 	%% @todo I haven't put as much thought as I should have on this,
 	%% the final settings handling will be very different.
 	local_settings = #{} :: map(),
+	next_settings = [] :: [{reference(), map()}],
 	%% @todo We need a TimerRef to do SETTINGS_TIMEOUT errors.
 	%% We need to be careful there. It's well possible that we send
 	%% two SETTINGS frames before we receive a SETTINGS ack.
-	next_settings = #{} :: undefined | map(), %% @todo perhaps set to undefined by default
+	% next_settings = #{} :: undefined | map(), %% @todo perhaps set to undefined by default
 	remote_settings = #{} :: map(),
 
 	%% Stream identifiers.
@@ -79,6 +80,7 @@
 	%% is established and continues normally. An exception is when a HEADERS
 	%% frame is sent followed by CONTINUATION frames: no other frame can be
 	%% sent in between.
+	parse_needs = 9 :: pos_integer(),
 	parse_state = undefined :: {preface, sequence, reference()}
 		| {preface, settings, reference()}
 		| normal
@@ -91,6 +93,7 @@
 
 -spec init(pid(), ranch:ref(), inet:socket(), module(), cowboy:opts()) -> ok.
 init(Parent, Ref, Socket, Transport, Opts) ->
+	io:format("init/5 ~p~n", [{Parent, Ref, Socket, Transport, Opts}]),
 	case Transport:peername(Socket) of
 		{ok, Peer} ->
 			init(Parent, Ref, Socket, Transport, Opts, Peer, <<>>);
@@ -102,10 +105,11 @@ init(Parent, Ref, Socket, Transport, Opts) ->
 -spec init(pid(), ranch:ref(), inet:socket(), module(), cowboy:opts(),
 	{inet:ip_address(), inet:port_number()}, binary()) -> ok.
 init(Parent, Ref, Socket, Transport, Opts, Peer, Buffer) ->
-	State = #state{parent=Parent, ref=Ref, socket=Socket,
+	io:format("init/7 ~p~n", [{Parent, Ref, Socket, Transport, Opts, Peer, Buffer}]),
+	State0 = #state{parent=Parent, ref=Ref, socket=Socket,
 		transport=Transport, opts=Opts, peer=Peer,
 		parse_state={preface, sequence, preface_timeout(Opts)}},
-	preface(State),
+	State = preface(State0),
 	case Buffer of
 		<<>> -> before_loop(State, Buffer);
 		_ -> parse(State, Buffer)
@@ -115,33 +119,44 @@ init(Parent, Ref, Socket, Transport, Opts, Peer, Buffer) ->
 -spec init(pid(), ranch:ref(), inet:socket(), module(), cowboy:opts(),
 	{inet:ip_address(), inet:port_number()}, binary(), map() | undefined, cowboy_req:req()) -> ok.
 init(Parent, Ref, Socket, Transport, Opts, Peer, Buffer, _Settings, Req) ->
+	io:format("init/9 ~p~n", [{Parent, Ref, Socket, Transport, Opts, Peer, Buffer, _Settings, Req}]),
 	State0 = #state{parent=Parent, ref=Ref, socket=Socket,
 		transport=Transport, opts=Opts, peer=Peer,
 		parse_state={preface, sequence, preface_timeout(Opts)}},
-	preface(State0),
+	State1 = preface(State0),
 	%% @todo Apply settings.
 	%% StreamID from HTTP/1.1 Upgrade requests is always 1.
 	%% The stream is always in the half-closed (remote) state.
-	State = stream_handler_init(State0, 1, fin, Req),
+	State = stream_handler_init(State1, 1, fin, Req),
 	case Buffer of
 		<<>> -> before_loop(State, Buffer);
 		_ -> parse(State, Buffer)
 	end.
 
-preface(#state{socket=Socket, transport=Transport, next_settings=Settings}) ->
-	%% We send next_settings and use defaults until we get a ack.
-	ok = Transport:send(Socket, cow_http2:settings(Settings)).
+preface(State=#state{opts=Opts, next_settings=[]}) ->
+	Settings = maps:get(http2_settings, Opts, #{}),
+	settings(State, Settings).
 
 preface_timeout(Opts) ->
 	PrefaceTimeout = maps:get(preface_timeout, Opts, 5000),
 	erlang:start_timer(PrefaceTimeout, self(), preface_timeout).
+
+settings(State=#state{socket=Socket, transport=Transport, opts=Opts, next_settings=NextSettings0}, Settings) ->
+	ok = Transport:send(Socket, cow_http2:settings(Settings)),
+	NextSettings = NextSettings0 ++ [{settings_timeout(Opts), Settings}],
+	State#state{next_settings=NextSettings}.
+
+settings_timeout(Opts) ->
+	SettingsTimeout = maps:get(settings_timeout, Opts, 5000),
+	erlang:start_timer(SettingsTimeout, self(), settings_timeout).
 
 %% @todo Add the timeout for last time since we heard of connection.
 before_loop(State, Buffer) ->
 	loop(State, Buffer).
 
 loop(State=#state{parent=Parent, socket=Socket, transport=Transport,
-		children=Children, parse_state=PS}, Buffer) ->
+		children=Children, next_settings=NS, parse_state=PS}, Buffer) ->
+	io:format("state ~p~n", [State]),
 	Transport:setopts(Socket, [{active, once}]),
 	{OK, Closed, Error} = Transport:messages(),
 	receive
@@ -165,6 +180,17 @@ loop(State=#state{parent=Parent, socket=Socket, transport=Transport,
 				_ ->
 					loop(State, Buffer)
 			end;
+		{timeout, TRef, settings_timeout} ->
+			case lists:keyfind(TRef, 1, NS) of
+				{TRef, _} ->
+					terminate(State, {connection_error, settings_timeout,
+						'The settings were not acknowledged in a reasonable amount of time.'});
+				false ->
+					loop(State, Buffer)
+			end;
+		%% Messages pertaining to the connection.
+		{{Pid, 0}, Msg} when Pid =:= self() ->
+			loop(info(State, Msg), Buffer);
 		%% Messages pertaining to a stream.
 		{{Pid, StreamID}, Msg} when Pid =:= self() ->
 			loop(info(State, StreamID, Msg), Buffer);
@@ -215,9 +241,11 @@ parse(State=#state{socket=Socket, transport=Transport, parse_state={preface, seq
 			end
 	end;
 %% @todo Perhaps instead of just more we can have {more, Len} to avoid all the checks.
-parse(State=#state{parse_state=ParseState}, Data) ->
+parse(State0=#state{parse_needs=Len0, parse_state=ParseState}, Data) when Len0 =< byte_size(Data) ->
 	case cow_http2:parse(Data) of
 		{ok, Frame, Rest} ->
+			io:format("frame: ~p~n", [Frame]),
+			State = State0#state{parse_needs=9},
 			case ParseState of
 				normal ->
 					parse(frame(State, Frame), Rest);
@@ -227,12 +255,17 @@ parse(State=#state{parse_state=ParseState}, Data) ->
 					parse(continuation_frame(State, Frame), Rest)
 			end;
 		{stream_error, StreamID, Reason, Human, Rest} ->
+			State = State0#state{parse_needs=9},
 			parse(stream_reset(State, StreamID, {stream_error, Reason, Human}), Rest);
 		Error = {connection_error, _, _} ->
+			State = State0#state{parse_needs=9},
 			terminate(State, Error);
-		more ->
+		{more, Len} ->
+			State = State0#state{parse_needs=Len},
 			before_loop(State, Data)
-	end.
+	end;
+parse(State, Data) ->
+	before_loop(State, Data).
 
 parse_settings_preface(State, Frame={settings, _}, Rest, TRef) ->
 	_ = erlang:cancel_timer(TRef, [{async, true}, {info, false}]),
@@ -298,9 +331,9 @@ frame(State=#state{socket=Socket, transport=Transport}, {settings, _Settings}) -
 	Transport:send(Socket, cow_http2:settings_ack()),
 	State;
 %% Ack for a previously sent SETTINGS frame.
-frame(State=#state{next_settings=_NextSettings}, settings_ack) ->
-	%% @todo Apply SETTINGS that require synchronization.
-	State;
+frame(State=#state{next_settings=[{TRef, Settings} | NextSettings]}, settings_ack) ->
+	_ = erlang:cancel_timer(TRef, [{async, true}, {info, false}]),
+	State#state{local_settings=Settings, next_settings=NextSettings};
 %% Unexpected PUSH_PROMISE frame.
 frame(State, {push_promise, _, _, _, _}) ->
 	terminate(State, {connection_error, protocol_error,
@@ -351,6 +384,9 @@ down(State=#state{children=Children0}, Pid, Msg) ->
 			State
 	end.
 
+info(State, {settings, Settings}) ->
+	settings(State, Settings).
+
 info(State=#state{streams=Streams}, StreamID, Msg) ->
 	case lists:keyfind(StreamID, #stream.id, Streams) of
 		Stream = #stream{state=StreamState0} ->
@@ -381,7 +417,7 @@ commands(State, Stream, [{error_response, _, _, _}|Tail]) ->
 %% @todo Kill the stream if it sent a response when one has already been sent.
 %% @todo Keep IsFin in the state.
 %% @todo Same two things above apply to DATA, possibly promise too.
-commands(State=#state{socket=Socket, transport=Transport, encode_state=EncodeState0},
+commands(State=#state{socket=Socket, transport=Transport, encode_state=EncodeState0, remote_settings=Settings},
 		Stream=#stream{id=StreamID, local=idle}, [{response, StatusCode, Headers0, Body}|Tail]) ->
 	Headers = Headers0#{<<":status">> => status(StatusCode)},
 	{HeaderBlock, EncodeState} = headers_encode(Headers, EncodeState0),
@@ -395,10 +431,8 @@ commands(State=#state{socket=Socket, transport=Transport, encode_state=EncodeSta
 				[{sendfile, fin, O, B, P}|Tail]);
 		_ ->
 			Transport:send(Socket, cow_http2:headers(StreamID, nofin, HeaderBlock)),
-			%% @todo 16384 is the default SETTINGS_MAX_FRAME_SIZE.
-			%% Use the length set by the server instead, if any.
-			%% @todo Would be better if we didn't have to convert to binary.
-			send_data(Socket, Transport, StreamID, fin, iolist_to_binary(Body), 16384),
+			MaxFrameSize = maps:get(max_frame_size, Settings, 16#4000),
+			send_data(Socket, Transport, StreamID, fin, Body, MaxFrameSize),
 			commands(State#state{encode_state=EncodeState}, Stream#stream{local=fin}, Tail)
 	end;
 %% @todo response when local!=idle
@@ -439,10 +473,14 @@ commands(State=#state{socket=Socket, transport=Transport}, Stream=#stream{id=Str
 %% to ensure the file is sent in chunks (which would require a better
 %% flow control at the stream handler level). One thing for sure, the
 %% implementation necessarily varies between HTTP/1.1 and HTTP/2.
-commands(State=#state{socket=Socket, transport=Transport}, Stream=#stream{id=StreamID, local=nofin},
+commands(State=#state{socket=Socket, transport=Transport, remote_settings=Settings},
+		Stream=#stream{id=StreamID, local=nofin},
 		[{sendfile, IsFin, Offset, Bytes, Path}|Tail]) ->
-	Transport:send(Socket, cow_http2:data_header(StreamID, IsFin, Bytes)),
-	Transport:sendfile(Socket, Path, Offset, Bytes),
+	MaxFrameSize = maps:get(max_frame_size, Settings, 16#4000),
+	send_file(Socket, Transport, StreamID, IsFin, Offset, Bytes, Path, MaxFrameSize),
+	% send_file()
+	% Transport:send(Socket, cow_http2:data_header(StreamID, IsFin, Bytes)),
+	% Transport:sendfile(Socket, Path, Offset, Bytes),
 	commands(State, Stream#stream{local=IsFin}, Tail);
 %% @todo sendfile when local!=nofin
 %% Send a push promise.
@@ -504,13 +542,110 @@ status(<< H, T, U, _/bits >>) when H >= $1, H =< $9, T >= $0, T =< $9, U >= $0, 
 
 %% This same function is found in gun_http2.
 send_data(Socket, Transport, StreamID, IsFin, Data, Length) ->
-	if
-		Length < byte_size(Data) ->
-			<< Payload:Length/binary, Rest/bits >> = Data,
-			Transport:send(Socket, cow_http2:data(StreamID, nofin, Payload)),
-			send_data(Socket, Transport, StreamID, IsFin, Rest, Length);
-		true ->
-			Transport:send(Socket, cow_http2:data(StreamID, IsFin, Data))
+	FlagEndStream = case IsFin of
+		nofin -> 0;
+		fin -> 1
+	end,
+	Frame = cow_http2:split_data(StreamID, #{
+		end_stream => FlagEndStream
+	}, #{
+		data => Data
+	}, Length),
+	Transport:send(Socket, Transport, Frame).
+
+send_file(Socket, Transport, StreamID, IsFin, Offset, Bytes, Filename, Length)
+		when Bytes > Length
+		andalso (is_list(Filename) orelse is_atom(Filename) orelse is_binary(Filename)) ->
+	case file:open(Filename, [read, raw, binary]) of
+		{ok, RawFile} ->
+			_ = case Offset of
+				0 ->
+					ok;
+				_ ->
+					{ok, _} = file:position(RawFile, {bof, Offset})
+			end,
+			try
+				send_file_loop(Socket, Transport, StreamID, IsFin, 0, Bytes, RawFile, Length)
+			after
+				ok = file:close(RawFile)
+			end;
+		Error = {error, _Reason} ->
+			Error
+	end;
+send_file(Socket, Transport, StreamID, IsFin, Offset, Bytes, RawFile, Length)
+		when Bytes > Length ->
+	Initial2 = case file:position(RawFile, {cur, 0}) of
+		{ok, Offset} ->
+			Offset;
+		{ok, Initial} ->
+			{ok, _} = file:position(RawFile, {bof, Offset}),
+			Initial
+		end,
+	case send_file_loop(Socket, Transport, StreamID, IsFin, 0, Bytes, RawFile, Length) of
+		Result = {ok, _Sent} ->
+			{ok, _} = file:position(RawFile, {bof, Initial2}),
+			Result;
+		Error = {error, _Reason} ->
+			Error
+	end;
+send_file(Socket, Transport, StreamID, IsFin, Offset, Bytes, Path, _Length) ->
+	Transport:send(Socket, cow_http2:data_header(StreamID, IsFin, Bytes)),
+	Transport:sendfile(Socket, Path, Offset, Bytes).
+
+send_file_loop(Socket, Transport, StreamID, IsFin, Sent, Sent, _RawFile, Length) ->
+	FlagEndStream = case IsFin of
+		fin -> 1;
+		nofin -> 0
+	end,
+	Frame = cow_http2:split_data(StreamID, #{ end_stream => FlagEndStream }, #{ data => [] }, Length),
+	case Transport:send(Socket, Frame) of
+		ok ->
+			{ok, Sent};
+		Error = {error, _Reason} ->
+			Error
+	end;
+send_file_loop(Socket, Transport, StreamID, IsFin, Sent, Bytes, RawFile, Length) ->
+	ReadSize = case Bytes of
+		0 -> Length;
+		_ -> min(Bytes - Sent, Length)
+	end,
+	case file:read(RawFile, ReadSize) of
+		{ok, IoData} ->
+			IsLastFrame = (Bytes - Sent - Length) =< 0,
+			Frame = if
+				IsLastFrame ->
+					FlagEndStream = case IsFin of
+						fin -> 1;
+						nofin -> 0
+					end,
+					cow_http2:split_data(StreamID, #{ end_stream => FlagEndStream }, #{ data => IoData }, Length);
+				true ->
+					cow_http2:split_data(StreamID, #{ end_stream => 0 }, #{ data => IoData }, Length)
+			end,
+			case Transport:send(Socket, Frame) of
+				ok when IsLastFrame == false ->
+					Sent2 = iolist_size(IoData) + Sent,
+					send_file_loop(Socket, Transport, StreamID, IsFin, Sent2, Bytes, RawFile, Length);
+				ok when IsLastFrame == true ->
+					Sent2 = iolist_size(IoData) + Sent,
+					{ok, Sent2};
+				Error = {error, _Reason} ->
+					Error
+			end;
+		eof ->
+			FlagEndStream = case IsFin of
+				fin -> 1;
+				nofin -> 0
+			end,
+			Frame = cow_http2:split_data(StreamID, #{ end_stream => FlagEndStream }, #{ data => [] }, Length),
+			case Transport:send(Socket, Frame) of
+				ok ->
+					{ok, Sent};
+				Error = {error, _Reason} ->
+					Error
+			end;
+		Error = {error, _Reason} ->
+			Error
 	end.
 
 -spec terminate(#state{}, _) -> no_return().

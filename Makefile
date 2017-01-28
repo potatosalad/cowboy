@@ -20,7 +20,7 @@ CI_ERLLVM ?= $(CI_HIPE)
 LOCAL_DEPS = crypto
 
 DEPS = cowlib ranch
-dep_cowlib = git https://github.com/ninenines/cowlib master
+dep_cowlib = git https://github.com/potatosalad/cowlib http2-frame-limits
 dep_ranch = git https://github.com/ninenines/ranch 1.3.0
 
 DOC_DEPS = asciideck
